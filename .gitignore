@@ -1,0 +1,29 @@
+# Qt 构建目录
+build/
+*-build-*
+*.autogen
+*.moc
+*.o
+*.obj
+*.exe
+*.dll
+*.a
+*.lib
+*.so
+*.dylib
+
+# 编辑器/IDE 临时文件
+*.user
+*.user.*
+*.pro.user*
+*.swp
+*.swo
+*~
+
+# 编译输出
+*.exe
+*.out
+*.app
+
+# 其他
+*.canvas   # 如果希望保留画布文件，可以删掉这一行
