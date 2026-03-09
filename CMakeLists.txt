@@ -40,6 +40,12 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
         CanvasExporter.cpp
         BrushPreset.h
         BrushPreset.cpp
+        UIWindow.h
+        UIWindow.cpp
+        Command.h
+        Command.cpp
+        ShortcutSettingsDialog.h
+        ShortcutSettingsDialog.cpp
 
 
 

@@ -2,7 +2,10 @@
 #define MAINWINDOW_H
 
 #include <QMainWindow>
+#include <QMap>
+#include <QKeySequence>
 #include "DrawingCore.h"
+#include "UIWindow.h"
 #include "NetworkManager.h"
 
 QT_BEGIN_NAMESPACE
@@ -11,6 +14,7 @@ QT_END_NAMESPACE
 
 class RoomServer;
 class CanvasExporter;
+class ShortcutSettingsDialog;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -24,6 +28,7 @@ private slots:
     void on_ellipseButton_triggered();
     void on_eraserFullButton_triggered();
     void on_eraserRealTimeButton_triggered();
+    void on_lassoButton_triggered();
     void on_colorButton_triggered();
     void on_undoButton_triggered();
     void on_redoButton_triggered();
@@ -52,9 +57,17 @@ private slots:
     void onMaxWidthChanged(int v);
     void onImportBrush();
 
-    // 修正：rowsMoved 信号的正确签名
+    // 新增选区操作槽函数
+    void on_paintSelectionAction_triggered();
+    void on_clearSelectionAction_triggered();
+    void on_dragSelectionAction_toggled(bool checked);
     void onLayerListRowsMoved(const QModelIndex &sourceParent, int sourceStart, int sourceEnd,
                               const QModelIndex &destinationParent, int destinationRow);
+    void onUndoRedoStateChanged(bool canUndo, bool canRedo);
+
+    // 新增：快捷键设置
+    void on_actionShortcutSettings_triggered();
+    void onShortcutsChanged(const QMap<QString, QKeySequence> &shortcuts);
 
 private:
     void setupUI();
@@ -72,6 +85,12 @@ private:
     void updateBrushPresetUI();
     void exportImage(const QString &title, const QString &filter, const QString &fmt);
 
+    // 新增：快捷键管理
+    void loadShortcuts();
+    void saveShortcuts();
+    void applyShortcuts();
+    void updateActionShortcut(const QString &id, QAction *action);
+
     Ui::MainWindow *ui;
     CanvasModel *m_model;
     CanvasView *m_view;
@@ -79,12 +98,16 @@ private:
     NetworkManager *m_network;
     RoomServer *m_roomServer = nullptr;
     CanvasExporter *m_exporter;
+    ShortcutSettingsDialog *m_shortcutDialog = nullptr;
 
     QString m_roomName;
     QString m_currentCanvasFile;
     QSize m_canvasSize;
 
     bool m_processingMove = false;
+
+    // 快捷键配置
+    QMap<QString, QKeySequence> m_shortcuts;
 };
 
-#endif
+#endif // MAINWINDOW_H

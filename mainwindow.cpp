@@ -3,12 +3,16 @@
 #include "RoomServer.h"
 #include "CanvasExporter.h"
 #include "CanvasDatabase.h"
+#include "ShortcutSettingsDialog.h"
 #include <QColorDialog>
 #include <QActionGroup>
 #include <QStatusBar>
 #include <QMessageBox>
 #include <QFileDialog>
 #include <QInputDialog>
+#include <QSettings>
+#include <QShortcut>
+#include <QKeySequence>
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), ui(new Ui::MainWindow), m_exporter(new CanvasExporter(this)), m_processingMove(false) {
     ui->setupUi(this);
@@ -43,6 +47,11 @@ void MainWindow::setupUI() {
     m_model->setCurrentBrushPresetId(1);
     m_controller->setCurrentBrushPreset(1);
     updateBrushPresetUI();
+    m_view->setController(m_controller);
+
+    // 加载快捷键设置
+    loadShortcuts();
+    applyShortcuts();
 }
 
 void MainWindow::setupConnections() {
@@ -56,24 +65,49 @@ void MainWindow::setupConnections() {
     connect(m_network, &NetworkManager::commandReceived, this, &MainWindow::onNetworkCommand);
     connect(m_model, &CanvasModel::layerChanged, this, &MainWindow::updateLayerList);
     connect(m_model, &CanvasModel::changed, this, &MainWindow::updateLayerControls);
-    connect(m_model, &CanvasModel::commandAdded, this, [this](const QJsonObject &d) { if (m_roomServer) m_roomServer->addCommand(d); });
+    connect(m_model, &CanvasModel::commandAdded, this, [this](const QJsonObject &d) {
+        if (m_roomServer) m_roomServer->addCommand(d);
+    });
 
-    connect(ui->brushPresetCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::onBrushPresetSelected);
+    connect(ui->brushPresetCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &MainWindow::onBrushPresetSelected);
     connect(ui->pressureCheckBox, &QCheckBox::toggled, this, &MainWindow::onPressureToggled);
-    connect(ui->minWidthSpinBox, QOverload<int>::of(&QSpinBox::valueChanged), this, &MainWindow::onMinWidthChanged);
-    connect(ui->maxWidthSpinBox, QOverload<int>::of(&QSpinBox::valueChanged), this, &MainWindow::onMaxWidthChanged);
+    connect(ui->minWidthSpinBox, QOverload<int>::of(&QSpinBox::valueChanged),
+            this, &MainWindow::onMinWidthChanged);
+    connect(ui->maxWidthSpinBox, QOverload<int>::of(&QSpinBox::valueChanged),
+            this, &MainWindow::onMaxWidthChanged);
     connect(ui->importBrushButton, &QPushButton::clicked, this, &MainWindow::onImportBrush);
+
+    connect(ui->lassoButton, &QAction::triggered, this, &MainWindow::on_lassoButton_triggered);
+    connect(ui->paintSelectionAction, &QAction::triggered, this, &MainWindow::on_paintSelectionAction_triggered);
+    connect(ui->clearSelectionAction, &QAction::triggered, this, &MainWindow::on_clearSelectionAction_triggered);
+    connect(ui->dragSelectionAction, &QAction::toggled, this, &MainWindow::on_dragSelectionAction_toggled);
+
+    connect(m_controller, &DrawingController::selectionChanged,
+            m_view, QOverload<>::of(&QGraphicsView::update));
+    connect(ui->dragSelectionAction, &QAction::toggled,
+            m_controller, &DrawingController::setDragModeEnabled);
+
+    connect(m_model, &CanvasModel::undoRedoStateChanged,
+            this, &MainWindow::onUndoRedoStateChanged);
+
+    // 快捷键设置
+    connect(ui->actionShortcutSettings, &QAction::triggered,
+            this, &MainWindow::on_actionShortcutSettings_triggered);
+}
+
+void MainWindow::onUndoRedoStateChanged(bool canUndo, bool canRedo) {
+    ui->undoButton->setEnabled(canUndo);
+    ui->redoButton->setEnabled(canRedo);
 }
 
 void MainWindow::setupLayerListDragDrop() {
-    // 启用内部拖放
     ui->layerListWidget->setDragDropMode(QAbstractItemView::InternalMove);
     ui->layerListWidget->setDefaultDropAction(Qt::MoveAction);
     ui->layerListWidget->setDragEnabled(true);
     ui->layerListWidget->setAcceptDrops(true);
     ui->layerListWidget->setDropIndicatorShown(true);
 
-    // 连接 rowsMoved 信号（正确的签名）
     QAbstractItemModel *model = ui->layerListWidget->model();
     connect(model, &QAbstractItemModel::rowsMoved, this, &MainWindow::onLayerListRowsMoved);
 }
@@ -83,16 +117,13 @@ void MainWindow::onLayerListRowsMoved(const QModelIndex &sourceParent, int sourc
     if (m_processingMove) return;
     m_processingMove = true;
 
-    // 计算目标索引（destinationRow 是插入位置，需要调整）
     int fromIndex = sourceStart;
     int toIndex = destinationRow;
 
-    // 如果向下移动，destinationRow 是目标位置+1，需要调整
     if (toIndex > fromIndex) {
         toIndex = toIndex - 1;
     }
 
-    // 边界检查
     auto layers = m_model->layers();
     if (fromIndex < 0 || fromIndex >= layers.size() ||
         toIndex < 0 || toIndex >= layers.size() ||
@@ -101,10 +132,8 @@ void MainWindow::onLayerListRowsMoved(const QModelIndex &sourceParent, int sourc
         return;
     }
 
-    // 执行图层移动
-    m_model->moveLayer(fromIndex, toIndex);
-
-    // 更新列表显示（保持选中状态）
+    // 使用命令移动图层
+    m_model->moveLayer(fromIndex, toIndex);  // 内部已改为命令方式
     updateLayerList();
     ui->layerListWidget->setCurrentRow(toIndex);
 
@@ -118,6 +147,7 @@ void MainWindow::setupToolGroup() {
     g->addAction(ui->ellipseButton);
     g->addAction(ui->eraserFullButton);
     g->addAction(ui->eraserRealTimeButton);
+    g->addAction(ui->lassoButton);
     ui->penButton->setChecked(true);
 }
 
@@ -130,7 +160,6 @@ void MainWindow::updateLayerList() {
         ui->layerListWidget->addItem(t);
     }
 
-    // 恢复当前选中
     auto layers = m_model->layers();
     for (int i = 0; i < layers.size(); ++i) {
         if (layers[i].id == m_model->currentLayerId()) {
@@ -313,6 +342,7 @@ void MainWindow::on_rectButton_triggered() { m_controller->setTool(DrawingContro
 void MainWindow::on_ellipseButton_triggered() { m_controller->setTool(DrawingController::Ellipse); }
 void MainWindow::on_eraserFullButton_triggered() { m_controller->setTool(DrawingController::EraserFull); }
 void MainWindow::on_eraserRealTimeButton_triggered() { m_controller->setTool(DrawingController::EraserRealTime); }
+void MainWindow::on_lassoButton_triggered() { m_controller->setTool(DrawingController::LassoTool); }
 
 void MainWindow::on_colorButton_triggered() {
     QColor c = QColorDialog::getColor(m_controller->currentColor(), this, tr("选择颜色"));
@@ -330,14 +360,15 @@ void MainWindow::on_opacitySpinBox_valueChanged(int v) {
 void MainWindow::on_widthSpinBox_valueChanged(int v) { syncWidthControls(v); }
 void MainWindow::on_undoButton_triggered() { m_controller->undo(); }
 void MainWindow::on_redoButton_triggered() { m_controller->redo(); }
-void MainWindow::on_clearButton_triggered() { m_controller->clear(); }
+void MainWindow::on_clearButton_triggered() { m_controller->clear(); } // 已改为命令方式
 
 void MainWindow::on_addLayerBtn_clicked() {
     bool ok;
     QString n = QInputDialog::getText(this, "新建图层", "图层名称:", QLineEdit::Normal,
                                       QString("图层%1").arg(m_model->layers().size() + 1), &ok);
     if (ok && !n.isEmpty()) {
-        int id = m_model->addLayer(n);
+        // 通过命令添加图层
+        int id = m_model->addLayer(n);  // 内部已改为命令
         m_model->setCurrentLayer(id);
         updateLayerList();
     }
@@ -350,6 +381,7 @@ void MainWindow::on_deleteLayerBtn_clicked() {
         QMessageBox::warning(this, "警告", "至少保留一个图层");
         return;
     }
+    // 通过命令删除图层
     m_model->removeLayer(m_model->layers()[r].id);
 }
 
@@ -375,7 +407,7 @@ void MainWindow::on_actionNewCanvas_triggered() {
     if (!ok) return;
     int h = QInputDialog::getInt(this, "新建画布", "高度 (100-2000):", 600, 100, 2000, 1, &ok);
     if (!ok) return;
-    m_model->clear();
+    m_model->clear();  // 清空所有图层（通过命令组实现）
     m_canvasSize = QSize(w, h);
     m_view->scene()->setSceneRect(0, 0, w, h);
     m_currentCanvasFile.clear();
@@ -392,9 +424,10 @@ void MainWindow::on_actionOpenCanvas_triggered() {
         QMessageBox::critical(this, "错误", "无法加载画布文件");
         return;
     }
-    m_model->clear();
+    m_model->clearHistory();  // 清空历史，因为加载新画布
+    m_model->clear();         // 清空当前内容
     m_model->setBrushPresets(presets);
-    for (const auto &c : cmds) m_model->add(c);
+    for (const auto &c : cmds) m_model->add(c);  // 直接添加（不经过命令）
     m_canvasSize = sz;
     m_view->scene()->setSceneRect(0, 0, sz.width(), sz.height());
     m_currentCanvasFile = f;
@@ -485,4 +518,152 @@ void MainWindow::onImportBrush() {
     m_model->addBrushPreset(p);
     updateBrushPresetUI();
     statusBar()->showMessage("笔刷导入成功", 2000);
+}
+
+void MainWindow::on_paintSelectionAction_triggered() {
+    m_controller->onPaintSelection();
+}
+
+void MainWindow::on_clearSelectionAction_triggered() {
+    m_controller->onClearSelection();
+}
+
+void MainWindow::on_dragSelectionAction_toggled(bool checked) {
+    if (checked) {
+        m_view->setCursor(Qt::SizeAllCursor);
+    } else {
+        m_view->setCursor(Qt::ArrowCursor);
+    }
+}
+
+// ========== 快捷键设置相关函数 ==========
+
+void MainWindow::on_actionShortcutSettings_triggered()
+{
+    if (!m_shortcutDialog) {
+        m_shortcutDialog = new ShortcutSettingsDialog(this);
+        connect(m_shortcutDialog, &ShortcutSettingsDialog::shortcutsChanged,
+                this, &MainWindow::onShortcutsChanged);
+    }
+
+    // 设置当前快捷键
+    for (auto it = m_shortcuts.begin(); it != m_shortcuts.end(); ++it) {
+        m_shortcutDialog->setShortcut(it.key(), it.value());
+    }
+
+    if (m_shortcutDialog->exec() == QDialog::Accepted) {
+        m_shortcuts = m_shortcutDialog->getShortcuts();
+        applyShortcuts();
+        saveShortcuts();
+    }
+}
+
+void MainWindow::onShortcutsChanged(const QMap<QString, QKeySequence> &shortcuts)
+{
+    m_shortcuts = shortcuts;
+    applyShortcuts();
+    saveShortcuts();
+}
+
+void MainWindow::applyShortcuts()
+{
+    // 工具类快捷键
+    updateActionShortcut(ShortcutSettingsDialog::ID_TOOL_PEN, ui->penButton);
+    updateActionShortcut(ShortcutSettingsDialog::ID_TOOL_RECT, ui->rectButton);
+    updateActionShortcut(ShortcutSettingsDialog::ID_TOOL_ELLIPSE, ui->ellipseButton);
+    updateActionShortcut(ShortcutSettingsDialog::ID_TOOL_ERASER_FULL, ui->eraserFullButton);
+    updateActionShortcut(ShortcutSettingsDialog::ID_TOOL_ERASER_REALTIME, ui->eraserRealTimeButton);
+    updateActionShortcut(ShortcutSettingsDialog::ID_TOOL_LASSO, ui->lassoButton);
+
+    // 编辑类快捷键
+    updateActionShortcut(ShortcutSettingsDialog::ID_EDIT_UNDO, ui->undoButton);
+    updateActionShortcut(ShortcutSettingsDialog::ID_EDIT_REDO, ui->redoButton);
+    updateActionShortcut(ShortcutSettingsDialog::ID_EDIT_CLEAR, ui->clearButton);
+
+    // 文件类快捷键
+    updateActionShortcut(ShortcutSettingsDialog::ID_FILE_NEW, ui->actionNewCanvas);
+    updateActionShortcut(ShortcutSettingsDialog::ID_FILE_OPEN, ui->actionOpenCanvas);
+    updateActionShortcut(ShortcutSettingsDialog::ID_FILE_SAVE, ui->actionSaveCanvas);
+
+    // 视图类快捷键
+    updateActionShortcut(ShortcutSettingsDialog::ID_VIEW_SYNC, ui->syncAction);
+
+    // 选区类快捷键
+    updateActionShortcut(ShortcutSettingsDialog::ID_SELECTION_PAINT, ui->paintSelectionAction);
+    updateActionShortcut(ShortcutSettingsDialog::ID_SELECTION_CLEAR, ui->clearSelectionAction);
+    updateActionShortcut(ShortcutSettingsDialog::ID_SELECTION_DRAG, ui->dragSelectionAction);
+}
+
+void MainWindow::updateActionShortcut(const QString &id, QAction *action)
+{
+    if (!action || !m_shortcuts.contains(id)) {
+        return;
+    }
+
+    QKeySequence shortcut = m_shortcuts[id];
+    action->setShortcut(shortcut);
+
+    // 更新工具提示显示快捷键
+    QString tooltip = action->toolTip();
+    // 移除旧的快捷键显示（如果有）
+    int parenIndex = tooltip.indexOf(" (");
+    if (parenIndex > 0) {
+        tooltip = tooltip.left(parenIndex);
+    }
+    // 添加新的快捷键显示
+    if (!shortcut.isEmpty()) {
+        tooltip += " (" + shortcut.toString(QKeySequence::NativeText) + ")";
+    }
+    action->setToolTip(tooltip);
+}
+
+void MainWindow::loadShortcuts()
+{
+    QSettings settings("YourCompany", "PaintingOnline");
+    settings.beginGroup("Shortcuts");
+
+    // 默认快捷键
+    m_shortcuts[ShortcutSettingsDialog::ID_TOOL_PEN] = QKeySequence("P");
+    m_shortcuts[ShortcutSettingsDialog::ID_TOOL_RECT] = QKeySequence("R");
+    m_shortcuts[ShortcutSettingsDialog::ID_TOOL_ELLIPSE] = QKeySequence("E");
+    m_shortcuts[ShortcutSettingsDialog::ID_TOOL_ERASER_FULL] = QKeySequence("F");
+    m_shortcuts[ShortcutSettingsDialog::ID_TOOL_ERASER_REALTIME] = QKeySequence("X");
+    m_shortcuts[ShortcutSettingsDialog::ID_TOOL_LASSO] = QKeySequence("L");
+    m_shortcuts[ShortcutSettingsDialog::ID_EDIT_UNDO] = QKeySequence("Ctrl+Z");
+    m_shortcuts[ShortcutSettingsDialog::ID_EDIT_REDO] = QKeySequence("Ctrl+Y");
+    m_shortcuts[ShortcutSettingsDialog::ID_EDIT_CLEAR] = QKeySequence("Ctrl+Shift+C");
+    m_shortcuts[ShortcutSettingsDialog::ID_FILE_NEW] = QKeySequence("Ctrl+N");
+    m_shortcuts[ShortcutSettingsDialog::ID_FILE_OPEN] = QKeySequence("Ctrl+O");
+    m_shortcuts[ShortcutSettingsDialog::ID_FILE_SAVE] = QKeySequence("Ctrl+S");
+    m_shortcuts[ShortcutSettingsDialog::ID_VIEW_SYNC] = QKeySequence("F5");
+
+    // 从设置加载（覆盖默认值）
+    QStringList keys = settings.allKeys();
+    for (const QString &key : keys) {
+        QString value = settings.value(key).toString();
+        if (!value.isEmpty()) {
+            m_shortcuts[key] = QKeySequence(value);
+        }
+    }
+
+    settings.endGroup();
+}
+
+void MainWindow::saveShortcuts()
+{
+    QSettings settings("YourCompany", "PaintingOnline");
+    settings.beginGroup("Shortcuts");
+
+    // 清除旧的设置
+    settings.remove("");
+
+    // 保存新的设置
+    for (auto it = m_shortcuts.begin(); it != m_shortcuts.end(); ++it) {
+        if (!it.value().isEmpty()) {
+            settings.setValue(it.key(), it.value().toString());
+        }
+    }
+
+    settings.endGroup();
+    settings.sync();
 }
