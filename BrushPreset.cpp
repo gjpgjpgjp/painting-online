@@ -17,18 +17,25 @@ int BrushPreset::widthForPressure(qreal pressure) const
 
 void BrushPreset::drawPoint(QPainter *painter, const QPointF &pos, const QColor &color, int width) const
 {
-    if (m_texture.isNull()) {
-        // 默认圆形
-        painter->setBrush(color);
-        painter->setPen(Qt::NoPen);
-        qreal r = width / 2.0;
-        painter->drawEllipse(pos, r, r);
-    } else {
-        // 使用纹理（缩放至 width×width）
+    if (width <= 0) width = 1;
+
+    // 如果有纹理且有效，使用纹理绘制
+    if (!m_texture.isNull()) {
+        // 缩放纹理至目标宽度（保持宽高比）
         QImage scaled = m_texture.scaled(width, width, Qt::KeepAspectRatio, Qt::SmoothTransformation);
-        QPointF drawPos = pos - QPointF(scaled.width()/2.0, scaled.height()/2.0);
-        painter->drawImage(drawPos, scaled);
+        if (!scaled.isNull() && scaled.width() > 0 && scaled.height() > 0) {
+            // 将图片绘制到指定位置（中心对齐）
+            QPointF drawPos = pos - QPointF(scaled.width() / 2.0, scaled.height() / 2.0);
+            painter->drawImage(drawPos, scaled);
+            return;
+        }
     }
+
+    // 没有纹理或缩放失败，回退到圆形
+    painter->setBrush(color);
+    painter->setPen(Qt::NoPen);
+    qreal r = width / 2.0;
+    painter->drawEllipse(pos, r, r);
 }
 
 QJsonObject BrushPreset::toJson() const

@@ -33,8 +33,11 @@ public:
     virtual bool isMergeable() const { return false; }
     virtual void merge(const Command* other) { Q_UNUSED(other) }
     qint64 timestamp() const { return m_timestamp; }
+    void setClientId(const QString &id) { m_clientId = id; }
+    QString clientId() const { return m_clientId; }
 protected:
     qint64 m_timestamp = 0;
+    QString m_clientId;
 };
 
 class DrawCommand : public Command {
@@ -61,6 +64,8 @@ public:
     void undo(CanvasModel* model) override;
     CommandType type() const override { return CommandType::DeleteDrawCmds; }
     QJsonObject toJson() const override;
+    const QList<int>& deletedCmdIds() const { return m_cmdIds; }
+    const QList<DrawCmd>& deletedCmds() const { return m_deletedCmds; }
 private:
     QList<int> m_cmdIds;
     QList<DrawCmd> m_deletedCmds;
@@ -74,6 +79,8 @@ public:
     void undo(CanvasModel* model) override;
     CommandType type() const override { return CommandType::MoveDrawCmds; }
     QJsonObject toJson() const override;
+    const QList<int>& movedCmdIds() const { return m_cmdIds; }
+    QPointF offset() const { return m_offset; }
 private:
     QList<int> m_cmdIds;
     QPointF m_offset;
@@ -87,7 +94,6 @@ protected:
     int m_layerId;
 };
 
-// 修改为只接受 layerId，在 execute 中保存所需数据
 class AddLayerCommand : public LayerCommand {
 public:
     AddLayerCommand(const QString& name, int assignedId = -1);
@@ -95,13 +101,14 @@ public:
     void undo(CanvasModel* model) override;
     CommandType type() const override { return CommandType::AddLayer; }
     QJsonObject toJson() const override;
+    QString layerName() const { return m_name; }
+    int assignedId() const { return m_assignedId; }
 private:
     QString m_name;
     int m_assignedId;
     Layer m_savedLayer;
 };
 
-// 修改为只接受 layerId，在 execute 中保存被删除的图层数据
 class RemoveLayerCommand : public LayerCommand {
 public:
     RemoveLayerCommand(int layerId);
@@ -109,6 +116,8 @@ public:
     void undo(CanvasModel* model) override;
     CommandType type() const override { return CommandType::RemoveLayer; }
     QJsonObject toJson() const override;
+    const Layer& savedLayer() const { return m_savedLayer; }
+    int oldCurrentLayerId() const { return m_oldCurrentLayerId; }
 private:
     Layer m_savedLayer;
     int m_oldCurrentLayerId;
@@ -122,12 +131,13 @@ public:
     void undo(CanvasModel* model) override;
     CommandType type() const override { return CommandType::MoveLayer; }
     QJsonObject toJson() const override;
+    int fromIndex() const { return m_fromIndex; }
+    int toIndex() const { return m_toIndex; }
 private:
     int m_fromIndex;
     int m_toIndex;
 };
 
-// 修改为只接受 layerId，在 execute 中保存当前命令列表
 class ClearLayerCommand : public LayerCommand {
 public:
     ClearLayerCommand(int layerId);
@@ -135,6 +145,8 @@ public:
     void undo(CanvasModel* model) override;
     CommandType type() const override { return CommandType::ClearLayer; }
     QJsonObject toJson() const override;
+    // 内联实现 savedCmds()，避免链接错误
+    const QList<DrawCmd>& savedCmds() const { return m_savedCmds; }
 private:
     QList<DrawCmd> m_savedCmds;
 };
@@ -146,11 +158,12 @@ public:
     void addCommand(Command* cmd);
     void execute(CanvasModel* model) override;
     void undo(CanvasModel* model) override;
-    CommandType type() const override { return CommandType::Composite; }
+    CommandType type() const override;
     QJsonObject toJson() const override;
+    const QList<Command*>& commands() const { return m_commands; }
+    QString name() const { return m_name; }
 private:
     QString m_name;
     QList<Command*> m_commands;
 };
-
 #endif // COMMAND_H

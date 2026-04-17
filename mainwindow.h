@@ -7,7 +7,7 @@
 #include "DrawingCore.h"
 #include "UIWindow.h"
 #include "NetworkManager.h"
-
+#include "Command.h"
 QT_BEGIN_NAMESPACE
 namespace Ui { class MainWindow; }
 QT_END_NAMESPACE
@@ -69,7 +69,17 @@ private slots:
     void on_actionShortcutSettings_triggered();
     void onShortcutsChanged(const QMap<QString, QKeySequence> &shortcuts);
 
+    // 新增：画布重置和状态接收
+    void onCanvasReset();
+    void onFullStateReceived(const QJsonObject &state);
+
+    // 新增：上传下载
+    void on_actionUploadCanvas_triggered();
+    void on_actionDownloadCanvas_triggered();
+
 private:
+    QPoint m_dragPosition;
+    bool eventFilter(QObject *obj, QEvent *event) override;
     void setupUI();
     void setupConnections();
     void setupToolGroup();
@@ -84,6 +94,10 @@ private:
     DrawCmd parseDrawCmd(const QJsonObject &d);
     void updateBrushPresetUI();
     void exportImage(const QString &title, const QString &filter, const QString &fmt);
+
+    // 新增：同步相关函数
+    void syncToServer();
+    void requestSyncFromServer();
 
     // 新增：快捷键管理
     void loadShortcuts();

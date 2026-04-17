@@ -13,6 +13,39 @@
 // 前向声明
 class Command;
 
+// 简单的画布元数据结构（内联定义，避免不完整类型问题）
+struct SimpleCanvasMetadata {
+    QSize size;
+    QColor backgroundColor = Qt::white;
+    QString createdBy;
+    qint64 createdAt = 0;
+    qint64 modifiedAt = 0;
+    QString canvasName;
+
+    QJsonObject toJson() const {
+        QJsonObject obj;
+        obj["width"] = size.width();
+        obj["height"] = size.height();
+        obj["backgroundColor"] = backgroundColor.name(QColor::HexArgb);
+        obj["createdBy"] = createdBy;
+        obj["createdAt"] = createdAt;
+        obj["modifiedAt"] = modifiedAt;
+        obj["canvasName"] = canvasName;
+        return obj;
+    }
+
+    void fromJson(const QJsonObject &obj) {
+        int width = obj["width"].toInt(800);
+        int height = obj["height"].toInt(600);
+        size = QSize(width, height);
+        backgroundColor = QColor(obj["backgroundColor"].toString("#FFFFFFFF"));
+        createdBy = obj["createdBy"].toString();
+        createdAt = obj["createdAt"].toVariant().toLongLong();
+        modifiedAt = obj["modifiedAt"].toVariant().toLongLong();
+        canvasName = obj["canvasName"].toString("未命名画布");
+    }
+};
+
 enum class CmdType { Pen, Rect, Ellipse, EraserStroke, PenPoint, Polygon };
 
 struct DrawCmd {
@@ -43,8 +76,13 @@ struct Layer {
 class CanvasModel : public QObject {
     Q_OBJECT
 public:
+    void ensureNextLayerId(int usedId) {
+        if (usedId >= m_nextLayerId) {
+            m_nextLayerId = usedId + 1;
+        }
+    }
     explicit CanvasModel(QObject *parent = nullptr);
-
+    void sendLayerOp(const QString &opType, int layerId, const QJsonObject &extra = QJsonObject());
     // 图层管理（命令版本）
     int addLayer(const QString &name);
     void removeLayer(int layerId);
@@ -98,6 +136,9 @@ public:
     // 网络
     void setNetworkManager(NetworkManager *net) { m_network = net; }
     void setRoomOwner(bool isOwner) { m_isRoomOwner = isOwner; }
+    void setClientId(const QString &id) { m_clientId = id; }
+    QString clientId() const { return m_clientId; }
+    bool isRoomOwner() const { return m_isRoomOwner; }
     NetworkManager* networkManager() const { return m_network; }
 
     // 笔刷预设
@@ -119,6 +160,30 @@ public:
     bool suppressEmit() const { return m_suppressEmit; }
     void setSuppressEmit(bool suppress) { m_suppressEmit = suppress; }
 
+    bool isOwnCommand(const QJsonObject &cmdData) const;
+    QJsonObject getFullState() const;
+    void applyFullState(const QJsonObject &state);
+
+    // 增量同步（用于大画布优化）
+    QJsonObject getDeltaState(qint64 sinceTimestamp) const;
+
+    // 画布元数据 - 使用简单结构体
+    void setCanvasMetadata(const SimpleCanvasMetadata &meta) { m_metadata = meta; }
+    SimpleCanvasMetadata canvasMetadata() const { return m_metadata; }
+
+    // 重置画布（用于新建画布）
+    void resetCanvas(const QSize &size, const QString &name);
+
+    // 获取画布尺寸
+    QSize canvasSize() const { return m_metadata.size; }
+
+    static void cmdToJson(QJsonObject &data, const DrawCmd &cmd);
+    static void jsonToCmd(DrawCmd &cmd, const QJsonObject &data);
+    bool findCommandById(int id, Layer *&outLayer, int &outIndex);
+
+    // 新增：辅助函数，将命令恢复到对应图层（带重复检查和ID排序）
+    void restoreCommandToLayer(const DrawCmd &cmd);
+
 signals:
     void changed();
     void layerChanged();
@@ -127,6 +192,9 @@ signals:
     void layerOperation(const QJsonObject &op);
     void brushPresetsChanged();
     void undoRedoStateChanged(bool canUndo, bool canRedo);
+    // 画布重置信号
+    void canvasReset();
+    void fullStateReceived(const QJsonObject &state);
 
 public slots:
     void onNetworkCommand(const QJsonObject &obj);
@@ -143,12 +211,10 @@ private:
     bool m_suppressEmit = false;
     bool m_isRoomOwner = false;
     QList<BrushPreset> m_brushPresets;
+    QString m_clientId;
 
     QList<DrawCmd>& currentLayerCommands();
-    void sendLayerOp(const QString &opType, int layerId, const QJsonObject &extra = QJsonObject());
-    static void cmdToJson(QJsonObject &data, const DrawCmd &cmd);
-    static void jsonToCmd(DrawCmd &cmd, const QJsonObject &data);
-    bool findCommandById(int id, Layer *&outLayer, int &outIndex);
+
 
     // 命令历史
     QStack<Command*> m_undoStack;
@@ -160,6 +226,12 @@ private:
 
     void pushUndo(Command* cmd);
     void clearStack(QStack<Command*>& stack);
+
+    // 使用简单结构体而非指针
+    SimpleCanvasMetadata m_metadata;
+
+    void removeCommandsDirect(const QList<int> &cmdIds);
+    void moveCommandsDirect(const QList<int> &cmdIds, const QPointF &offset);
 };
 
 #endif // DRAWINGCORE_H

@@ -15,7 +15,7 @@
 CanvasView::CanvasView(QWidget *parent) : QGraphicsView(parent) {
     setScene(new QGraphicsScene(this));
     setRenderHint(QPainter::Antialiasing);
-    setBackgroundBrush(Qt::white);
+    setBackgroundBrush(Qt::white);   // 改为纯白，不透明
     setDragMode(QGraphicsView::NoDrag);
     setViewportUpdateMode(QGraphicsView::SmartViewportUpdate);
     setTransformationAnchor(QGraphicsView::AnchorUnderMouse);
@@ -26,11 +26,20 @@ CanvasView::CanvasView(QWidget *parent) : QGraphicsView(parent) {
 
 void CanvasView::renderCommands(const QList<DrawCmd> &cmds) {
     clearSceneItems();
-    QTransform oldTransform = transform();
-    for (const auto &cmd : cmds) {
-        renderCommandToScene(cmd);
+    auto layers = m_model->layers();
+    for (int i = layers.size() - 1; i >= 0; --i) {
+        const auto &layer = layers[i];
+        if (!layer.visible) continue;
+        for (const auto &cmd : layer.commands) {
+            if (cmd.layerId == layer.id) {
+                DrawCmd cmdWithAlpha = cmd;
+                QColor c = cmd.color;
+                c.setAlphaF(c.alphaF() * layer.opacity);   // 应用图层透明度
+                cmdWithAlpha.color = c;
+                renderCommandToScene(cmdWithAlpha);
+            }
+        }
     }
-    setTransform(oldTransform);
 }
 
 void CanvasView::renderCommand(const DrawCmd &cmd) {
@@ -69,26 +78,30 @@ void CanvasView::renderCommandToScene(const DrawCmd &cmd) {
         // 擦除命令不再渲染
         break;
     case CmdType::PenPoint: {
+        // ========== 这里需要修改 ==========
         BrushPreset *preset = m_model ? m_model->getBrushPreset(cmd.presetId) : nullptr;
         if (preset && !preset->texture().isNull()) {
             int width = cmd.width;
-            int margin = 2;
-            int size = width + margin * 2;
-            QImage img(size, size, QImage::Format_ARGB32_Premultiplied);
-            img.fill(Qt::transparent);
-            QPainter p(&img);
-            p.setRenderHint(QPainter::Antialiasing);
-            preset->drawPoint(&p, QPointF(size/2.0, size/2.0), cmd.color, width);
-            p.end();
-            auto *pixItem = scene()->addPixmap(QPixmap::fromImage(img));
-            pixItem->setPos(cmd.point - QPointF(size/2.0, size/2.0));
-            pixItem->setCacheMode(QGraphicsItem::DeviceCoordinateCache);
-            item = pixItem;
+            if (width <= 0) width = 1;
+            QImage scaled = preset->texture().scaled(width, width, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+            if (!scaled.isNull() && scaled.width() > 0 && scaled.height() > 0) {
+                auto *pixItem = scene()->addPixmap(QPixmap::fromImage(scaled));
+                pixItem->setPos(cmd.point - QPointF(scaled.width()/2.0, scaled.height()/2.0));
+                pixItem->setCacheMode(QGraphicsItem::DeviceCoordinateCache);
+                item = pixItem;
+            } else {
+                // 缩放失败，回退圆形
+                qreal r = cmd.width / 2.0;
+                item = scene()->addEllipse(cmd.point.x() - r, cmd.point.y() - r, cmd.width, cmd.width,
+                                           Qt::NoPen, QBrush(cmd.color));
+            }
         } else {
+            // 无预设或纹理，绘制圆形
             qreal r = cmd.width / 2.0;
-            item = scene()->addEllipse(cmd.point.x() - r, cmd.point.y() - r,
-                                       cmd.width, cmd.width, Qt::NoPen, QBrush(cmd.color));
+            item = scene()->addEllipse(cmd.point.x() - r, cmd.point.y() - r, cmd.width, cmd.width,
+                                       Qt::NoPen, QBrush(cmd.color));
         }
+        // ==================================
         break;
     }
     case CmdType::Polygon: {

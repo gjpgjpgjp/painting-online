@@ -13,24 +13,48 @@
 #include <QSettings>
 #include <QShortcut>
 #include <QKeySequence>
+#include <QDateTime>
+#include <QUuid>
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), ui(new Ui::MainWindow), m_exporter(new CanvasExporter(this)), m_processingMove(false) {
+    // 透明无边框窗口
+    setWindowFlags(Qt::FramelessWindowHint | Qt::Window);
+    setAttribute(Qt::WA_TranslucentBackground, true);
+
     ui->setupUi(this);
     setupUI();
     setupConnections();
     setupToolGroup();
     setupLayerListDragDrop();
+
+    // 标题栏按钮连接
+    connect(ui->minimizeBtn, &QPushButton::clicked, this, &QMainWindow::showMinimized);
+    connect(ui->maximizeBtn, &QPushButton::clicked, this, [this](){
+        if (this->isMaximized())
+            this->showNormal();
+        else
+            this->showMaximized();
+    });
+    connect(ui->closeBtn, &QPushButton::clicked, this, &QMainWindow::close);
+
+    // 允许拖动标题栏移动窗口
+    ui->titleBar->installEventFilter(this);
 }
 
 MainWindow::~MainWindow() { delete ui; }
 
 void MainWindow::setupUI() {
+    // 不再需要透明属性
+    // this->setAttribute(Qt::WA_TranslucentBackground, true);
+
     m_network = new NetworkManager(this);
     m_model = new CanvasModel(this);
     m_model->setNetworkManager(m_network);
     m_view = new CanvasView(this);
     m_view->setModel(m_model);
     m_controller = new DrawingController(m_model, m_view, this);
+    QString clientId = QUuid::createUuid().toString();
+    m_model->setClientId(clientId);
 
     ui->canvasLayout->addWidget(m_view);
     ui->widthSlider->setValue(ui->widthSpinBox->value());
@@ -94,6 +118,10 @@ void MainWindow::setupConnections() {
     // 快捷键设置
     connect(ui->actionShortcutSettings, &QAction::triggered,
             this, &MainWindow::on_actionShortcutSettings_triggered);
+
+    // 新增：画布重置和状态接收信号
+    connect(m_model, &CanvasModel::canvasReset, this, &MainWindow::onCanvasReset);
+    connect(m_model, &CanvasModel::fullStateReceived, this, &MainWindow::onFullStateReceived);
 }
 
 void MainWindow::onUndoRedoStateChanged(bool canUndo, bool canRedo) {
@@ -250,9 +278,22 @@ void MainWindow::onNetworkConnected() {
     j["room"] = m_roomName;
     j["action"] = ui->createRoomRadio->isChecked() ? "create" : "join";
     m_network->sendCommand(j);
+
+    // ========== 修改：切换到画布模式 ==========
+    // 隐藏登录面板（透明背景区域）
     ui->connectWidget->setVisible(false);
+
+    // 显示画布容器（纯白背景，不透明，适合绘画）
     ui->canvasContainer->setVisible(true);
     ui->mainToolBar->setVisible(true);
+
+    // 可选：最大化窗口以获得更多绘画空间
+    this->showMaximized();
+
+    // 或者使用全屏模式（无边框）：
+    // this->showFullScreen();
+    // ======================================
+
     statusBar()->showMessage("已连接到服务器");
     if (!ui->createRoomRadio->isChecked()) {
         QJsonObject req;
@@ -263,13 +304,24 @@ void MainWindow::onNetworkConnected() {
 
 void MainWindow::onNetworkDisconnected() {
     statusBar()->showMessage("已断开连接");
+
+    // ========== 修改：恢复到登录界面 ==========
+    // 显示登录面板（玻璃效果，透明背景）
     ui->connectWidget->setVisible(true);
+
+    // 隐藏画布容器和工具栏
     ui->canvasContainer->setVisible(false);
     ui->mainToolBar->setVisible(false);
+
+    // 如果窗口是最大化状态，恢复为普通大小
+    if (this->isMaximized()) {
+        this->showNormal();
+    }
+    // ======================================
+
     m_model->setRoomOwner(false);
     cleanupRoomServer();
 }
-
 void MainWindow::onNetworkError(const QString &err) {
     QMessageBox::critical(this, "网络错误", "连接服务器失败: " + err);
     cleanupRoomServer();
@@ -296,45 +348,166 @@ DrawCmd MainWindow::parseDrawCmd(const QJsonObject &d) {
     return c;
 }
 
+// 修改：网络命令处理 - 增强同步处理（合并所有处理逻辑到这里）
 void MainWindow::onNetworkCommand(const QJsonObject &obj) {
     QString t = obj["type"].toString();
-    if (t == "syncRequest" && m_roomServer) {
-        QJsonObject s;
-        s["type"] = "fullSync";
-        s["layers"] = m_model->layersToJson();
-        s["currentLayerId"] = m_model->currentLayerId();
-        QJsonArray cmds;
-        for (const auto &c : m_model->getCommandData()) cmds.append(c);
-        s["cmds"] = cmds;
-        m_network->sendCommand(s);
-    } else if (t == "fullSync") {
-        if (obj.contains("layers")) {
-            m_model->layersFromJson(obj["layers"].toArray());
-            if (m_model->getLayer(obj["currentLayerId"].toInt()))
-                m_model->setCurrentLayer(obj["currentLayerId"].toInt());
-        }
-        if (m_roomServer) return;
-        m_model->clear();
-        for (const auto &v : obj["cmds"].toArray()) {
-            auto c = parseDrawCmd(v.toObject());
-            if (!m_model->getLayer(c.layerId))
-                m_model->addLayer(QString("图层%1").arg(c.layerId));
-            m_model->add(c);
-        }
+
+    if (t == "undoCmd" || t == "redoCmd") {
         updateLayerList();
-    } else if (t == "layerOp" || t == "layerSync") {
+        m_view->clearSceneItems();
+        m_view->renderCommands(m_model->allCommands());
+        onUndoRedoStateChanged(m_model->canUndo(), m_model->canRedo());
+
+        QString cmdTypeStr;
+        int cmdType = obj["undoneCmdType"].toInt();
+        if (t == "redoCmd") {
+            cmdType = obj["redoneCmdType"].toInt();
+        }
+
+        switch (static_cast<CommandType>(cmdType)) {
+        case CommandType::DrawCmd: cmdTypeStr = "绘制"; break;
+        case CommandType::DeleteDrawCmds: cmdTypeStr = "删除"; break;
+        case CommandType::MoveDrawCmds: cmdTypeStr = "移动"; break;
+        case CommandType::AddLayer: cmdTypeStr = "添加图层"; break;
+        case CommandType::RemoveLayer: cmdTypeStr = "删除图层"; break;
+        case CommandType::MoveLayer: cmdTypeStr = "移动图层"; break;
+        case CommandType::ClearLayer: cmdTypeStr = "清空图层"; break;
+        case CommandType::Composite: cmdTypeStr = "复合操作"; break;
+        default: cmdTypeStr = "未知操作"; break;
+        }
+
+        QString action = (t == "undoCmd") ? "撤销" : "重做";
+        statusBar()->showMessage(QString("远端%1了%2").arg(action, cmdTypeStr), 2000);
+        return;
+    }
+
+    if (t == "fullState") {
+        QJsonObject state = obj;
+        m_model->applyFullState(state);
+        m_canvasSize = m_model->canvasSize();
+        m_view->scene()->setSceneRect(0, 0, m_canvasSize.width(), m_canvasSize.height());
+        updateLayerList();
+        updateBrushPresetUI();
+        statusBar()->showMessage("画布同步完成");
+    }
+    else if (t == "canvasReset") {
+        if (obj.contains("state")) {
+            m_model->applyFullState(obj["state"].toObject());
+            m_canvasSize = m_model->canvasSize();
+            m_view->scene()->setSceneRect(0, 0, m_canvasSize.width(), m_canvasSize.height());
+            updateLayerList();
+            updateBrushPresetUI();
+            statusBar()->showMessage("画布已重置");
+        }
+    }
+    else if (t == "init") {
+        QJsonArray cmds = obj["cmds"].toArray();
+        for (const auto &v : cmds) {
+            DrawCmd cmd = parseDrawCmd(v.toObject());
+            m_model->add(cmd, false);
+        }
+        m_view->renderCommands(m_model->allCommands());
+        updateLayerList();
+        statusBar()->showMessage(QString("已加载历史记录 (%1 条命令)").arg(cmds.size()));
+    }
+    else if (t == "syncRequest" && m_roomServer) {
+        QJsonObject state = m_model->getFullState();
+        state["type"] = "fullState";
+        m_network->sendCommand(state);
+    }
+    else if (t == "layerOp" || t == "layerSync") {
         m_model->onNetworkLayerOp(obj);
         updateLayerList();
     }
+    else if (t == "uploadAck") {
+        bool success = obj["success"].toBool();
+        if (success) {
+            statusBar()->showMessage("画布上传成功: " + obj["fileName"].toString(), 3000);
+        } else {
+            QMessageBox::warning(this, "上传失败",
+                                 "上传画布失败: " + obj["error"].toString());
+        }
+    }
+    else if (t == "downloadData") {
+        QJsonObject data = obj["data"].toObject();
+        QString fileName = obj["fileName"].toString();
+
+        auto reply = QMessageBox::question(this, "下载画布",
+                                           "是否用下载的画布替换当前画布？",
+                                           QMessageBox::Yes | QMessageBox::No);
+        if (reply == QMessageBox::Yes) {
+            m_model->applyFullState(data);
+            m_canvasSize = m_model->canvasSize();
+            m_view->scene()->setSceneRect(0, 0, m_canvasSize.width(), m_canvasSize.height());
+            updateLayerList();
+            updateBrushPresetUI();
+            statusBar()->showMessage("画布下载完成: " + fileName, 3000);
+        }
+    }
+    else if (t == "downloadError") {
+        QMessageBox::warning(this, "下载失败",
+                             "下载画布失败: " + obj["error"].toString());
+    }
+    else if (t == "canvasFileList") {
+        QJsonArray fileList = obj["files"].toArray();
+        if (fileList.isEmpty()) {
+            QMessageBox::information(this, "文件列表", "服务器上没有找到画布文件");
+            return;
+        }
+
+        QStringList files;
+        for (const auto &v : fileList) {
+            files.append(v.toString());
+        }
+
+        bool ok;
+        QString selected = QInputDialog::getItem(this, "选择画布文件", "请选择要下载的画布:", files, 0, false, &ok);
+        if (!ok || selected.isEmpty()) return;
+
+        QJsonObject download;
+        download["type"] = "downloadCanvas";
+        download["fileName"] = selected;
+        m_network->sendCommand(download);
+        statusBar()->showMessage("正在下载画布: " + selected);
+    }
+}
+// 修改：同步功能 - 现在支持双向同步
+void MainWindow::on_syncAction_triggered() {
+    if (!m_network || !m_network->isConnected()) {
+        QMessageBox::warning(this, "未连接", "请先连接到服务器");
+        return;
+    }
+
+    // 房主：上传当前完整状态到服务器
+    if (ui->createRoomRadio->isChecked() || m_model->isRoomOwner()) {
+        syncToServer();
+    } else {
+        // 客人：从服务器拉取最新状态
+        requestSyncFromServer();
+    }
 }
 
-void MainWindow::on_syncAction_triggered() {
-    if (m_network && m_network->isConnected() && !ui->createRoomRadio->isChecked()) {
-        QJsonObject req;
-        req["type"] = "syncRequest";
-        m_network->sendCommand(req);
-        statusBar()->showMessage("请求同步中...");
+void MainWindow::syncToServer() {
+    QJsonObject state = m_model->getFullState();
+    state["type"] = "fullState";
+
+    // 如果是房主，直接设置服务器状态
+    if (m_roomServer) {
+        m_roomServer->setFullState(state);
+        statusBar()->showMessage("画布状态已同步到服务器");
+    } else {
+        // 否则发送给服务器
+        m_network->sendCommand(state);
+        statusBar()->showMessage("正在上传画布状态...");
     }
+}
+
+void MainWindow::requestSyncFromServer() {
+    QJsonObject req;
+    req["type"] = "syncRequest";
+    req["timestamp"] = QDateTime::currentMSecsSinceEpoch();
+    m_network->sendCommand(req);
+    statusBar()->showMessage("正在从服务器同步画布...");
 }
 
 void MainWindow::on_penButton_triggered() { m_controller->setTool(DrawingController::Pen); }
@@ -401,51 +574,101 @@ void MainWindow::on_layerOpacitySlider_valueChanged(int v) {
     m_model->setLayerOpacity(m_model->currentLayerId(), v / 100.0);
 }
 
+// 修改：新建画布 - 现在会广播到所有客户端
 void MainWindow::on_actionNewCanvas_triggered() {
     bool ok;
-    int w = QInputDialog::getInt(this, "新建画布", "宽度 (100-2000):", 800, 100, 2000, 1, &ok);
+    int w = QInputDialog::getInt(this, "新建画布", "宽度 (100-4000):", 800, 100, 4000, 1, &ok);
     if (!ok) return;
-    int h = QInputDialog::getInt(this, "新建画布", "高度 (100-2000):", 600, 100, 2000, 1, &ok);
+    int h = QInputDialog::getInt(this, "新建画布", "高度 (100-4000):", 600, 100, 4000, 1, &ok);
     if (!ok) return;
-    m_model->clear();  // 清空所有图层（通过命令组实现）
+
+    QString name = QInputDialog::getText(this, "新建画布", "画布名称:",
+                                         QLineEdit::Normal, "未命名画布", &ok);
+    if (!ok) return;
+
+    // 重置画布（会自动广播）
+    m_model->resetCanvas(QSize(w, h), name);
+
     m_canvasSize = QSize(w, h);
     m_view->scene()->setSceneRect(0, 0, w, h);
     m_currentCanvasFile.clear();
-    statusBar()->showMessage("新建画布");
-}
 
-void MainWindow::on_actionOpenCanvas_triggered() {
-    QString f = QFileDialog::getOpenFileName(this, "选择画布文件", "", "画布文件 (*.canvas);;所有文件 (*)");
-    if (f.isEmpty()) return;
-    QList<DrawCmd> cmds;
-    QSize sz;
-    QList<BrushPreset> presets;
-    if (!CanvasDatabase::load(f, cmds, sz, presets)) {
-        QMessageBox::critical(this, "错误", "无法加载画布文件");
-        return;
-    }
-    m_model->clearHistory();  // 清空历史，因为加载新画布
-    m_model->clear();         // 清空当前内容
-    m_model->setBrushPresets(presets);
-    for (const auto &c : cmds) m_model->add(c);  // 直接添加（不经过命令）
-    m_canvasSize = sz;
-    m_view->scene()->setSceneRect(0, 0, sz.width(), sz.height());
-    m_currentCanvasFile = f;
-    statusBar()->showMessage("画布加载成功");
+    updateLayerList();
     updateBrushPresetUI();
+    statusBar()->showMessage("新建画布: " + name);
 }
 
+// 修改：保存画布 - 现在保存完整状态
 void MainWindow::on_actionSaveCanvas_triggered() {
-    QString f = QFileDialog::getSaveFileName(this, "保存画布", m_currentCanvasFile, "画布文件 (*.canvas);;所有文件 (*)");
+    QString f = QFileDialog::getSaveFileName(this, "保存画布", m_currentCanvasFile,
+                                             "画布文件 (*.canvas);;所有文件 (*)");
     if (f.isEmpty()) return;
-    QSize sz = m_view->scene()->sceneRect().size().toSize();
-    if (sz.isEmpty()) sz = m_canvasSize;
-    if (!CanvasDatabase::save(f, m_model->allCommands(), sz, m_model->brushPresets())) {
+
+    // 更新元数据
+    SimpleCanvasMetadata meta = m_model->canvasMetadata();
+    meta.modifiedAt = QDateTime::currentMSecsSinceEpoch();
+    meta.size = m_canvasSize;
+    m_model->setCanvasMetadata(meta);
+
+    if (!CanvasDatabase::save(f, m_model->allCommands(), meta,
+                              m_model->layers(), m_model->brushPresets())) {
         QMessageBox::critical(this, "错误", "无法保存画布");
         return;
     }
+
     m_currentCanvasFile = f;
-    statusBar()->showMessage("画布保存成功");
+    statusBar()->showMessage("画布保存成功: " + f);
+}
+
+// 修改：打开画布 - 现在加载完整状态并可选同步到服务器
+void MainWindow::on_actionOpenCanvas_triggered() {
+    QString f = QFileDialog::getOpenFileName(this, "选择画布文件", "",
+                                             "画布文件 (*.canvas);;所有文件 (*)");
+    if (f.isEmpty()) return;
+
+    QList<DrawCmd> cmds;
+    SimpleCanvasMetadata meta;
+    QList<Layer> layers;
+    QList<BrushPreset> presets;
+
+    if (!CanvasDatabase::load(f, cmds, meta, layers, presets)) {
+        QMessageBox::critical(this, "错误", "无法加载画布文件");
+        return;
+    }
+
+    // 应用加载的状态
+    m_model->setSuppressEmit(true);
+    m_model->setCanvasMetadata(meta);
+    m_model->setBrushPresets(presets);
+
+    // 使用applyFullState更高效
+    QJsonObject state = CanvasDatabase::exportToJson(cmds, meta, layers, presets);
+    state["currentLayerId"] = 0;
+    state["nextCmdId"] = cmds.isEmpty() ? 1 : cmds.last().id + 1;
+    state["nextLayerId"] = layers.isEmpty() ? 1 :
+                               (*std::max_element(layers.begin(), layers.end(),
+                                                  [](const Layer& a, const Layer& b) { return a.id < b.id; })).id + 1;
+
+    m_model->applyFullState(state);
+    m_model->setSuppressEmit(false);
+
+    m_canvasSize = meta.size;
+    m_view->scene()->setSceneRect(0, 0, meta.size.width(), meta.size.height());
+    m_currentCanvasFile = f;
+
+    updateLayerList();
+    updateBrushPresetUI();
+    statusBar()->showMessage("画布加载成功: " + meta.canvasName);
+
+    // 如果已连接，询问是否同步到服务器
+    if (m_network && m_network->isConnected()) {
+        auto reply = QMessageBox::question(this, "同步到服务器",
+                                           "是否将打开的画布同步到服务器？\n这将覆盖服务器上的当前画布。",
+                                           QMessageBox::Yes | QMessageBox::No);
+        if (reply == QMessageBox::Yes) {
+            syncToServer();
+        }
+    }
 }
 
 void MainWindow::exportImage(const QString &title, const QString &filter, const QString &fmt) {
@@ -463,14 +686,37 @@ void MainWindow::on_actionExportJPEG_triggered() { exportImage("导出JPEG", "JP
 void MainWindow::setWidth(int v) { syncWidthControls(v); }
 
 void MainWindow::updateBrushPresetUI() {
+    if (!ui->brushPresetCombo) {
+        qWarning() << "brushPresetCombo is null!";
+        return;
+    }
+
+    // 临时阻断信号，避免在清除/添加时触发槽函数
+    ui->brushPresetCombo->blockSignals(true);
     ui->brushPresetCombo->clear();
+
     for (const auto &p : m_model->brushPresets())
         ui->brushPresetCombo->addItem(p.name(), p.id());
-    ui->brushPresetCombo->setCurrentIndex(ui->brushPresetCombo->findData(m_model->currentBrushPresetId()));
+
+    int index = ui->brushPresetCombo->findData(m_model->currentBrushPresetId());
+    if (index >= 0)
+        ui->brushPresetCombo->setCurrentIndex(index);
+
+    ui->brushPresetCombo->blockSignals(false);
+
+    // 更新压力感应等控件
     if (auto *p = m_model->getBrushPreset(m_model->currentBrushPresetId())) {
+        ui->pressureCheckBox->blockSignals(true);
+        ui->minWidthSpinBox->blockSignals(true);
+        ui->maxWidthSpinBox->blockSignals(true);
+
         ui->pressureCheckBox->setChecked(p->usePressure());
         ui->minWidthSpinBox->setValue(p->minWidth());
         ui->maxWidthSpinBox->setValue(p->maxWidth());
+
+        ui->pressureCheckBox->blockSignals(false);
+        ui->minWidthSpinBox->blockSignals(false);
+        ui->maxWidthSpinBox->blockSignals(false);
     }
 }
 
@@ -500,24 +746,42 @@ void MainWindow::onMaxWidthChanged(int v) {
 void MainWindow::onImportBrush() {
     QString f = QFileDialog::getOpenFileName(this, "选择笔刷图片", "", "图片 (*.png *.jpg *.bmp)");
     if (f.isEmpty()) return;
+
     QImage img(f);
     if (img.isNull()) {
         QMessageBox::warning(this, "错误", "无法加载图片文件");
         return;
     }
+
     const int maxSize = 128;
     if (img.width() > maxSize || img.height() > maxSize)
         img = img.scaled(maxSize, maxSize, Qt::KeepAspectRatio, Qt::SmoothTransformation);
-    if (img.format() != QImage::Format_ARGB32_Premultiplied)
-        img = img.convertToFormat(QImage::Format_ARGB32_Premultiplied);
-    int id = m_model->brushPresets().isEmpty() ? 1 : m_model->brushPresets().last().id() + 1;
-    BrushPreset p(id, QFileInfo(f).baseName());
+
+    // 确保图片格式为 ARGB32（支持透明）
+    if (img.format() != QImage::Format_ARGB32 && img.format() != QImage::Format_ARGB32_Premultiplied)
+        img = img.convertToFormat(QImage::Format_ARGB32);
+
+    int newId = m_model->brushPresets().isEmpty() ? 1 : m_model->brushPresets().last().id() + 1;
+    BrushPreset p(newId, QFileInfo(f).baseName());
     p.setTexture(img);
-    p.setMinWidth(10);
+    p.setMinWidth(1);
     p.setMaxWidth(50);
+    p.setUsePressure(false);  // 先关闭压力感应，方便测试
+
+    // 禁止模型在添加时发射信号，避免界面刷新冲突
+    bool oldSuppress = m_model->suppressEmit();
+    m_model->setSuppressEmit(true);
     m_model->addBrushPreset(p);
+    m_model->setSuppressEmit(oldSuppress);
+
+    // 关键：切换到新笔刷
+    m_model->setCurrentBrushPresetId(newId);
+    m_controller->setCurrentBrushPreset(newId);
+
+    // 刷新笔刷下拉框并选中新笔刷
     updateBrushPresetUI();
-    statusBar()->showMessage("笔刷导入成功", 2000);
+
+    statusBar()->showMessage("笔刷导入成功: " + p.name(), 2000);
 }
 
 void MainWindow::on_paintSelectionAction_triggered() {
@@ -534,6 +798,25 @@ void MainWindow::on_dragSelectionAction_toggled(bool checked) {
     } else {
         m_view->setCursor(Qt::ArrowCursor);
     }
+}
+
+// 新增：画布重置处理
+void MainWindow::onCanvasReset() {
+    m_view->clearSceneItems();
+    m_view->renderCommands(m_model->allCommands());
+    updateLayerList();
+    updateBrushPresetUI();
+}
+
+// 新增：完整状态接收处理
+void MainWindow::onFullStateReceived(const QJsonObject &state) {
+    Q_UNUSED(state)
+    // 状态已应用，更新UI
+    m_view->clearSceneItems();
+    m_view->renderCommands(m_model->allCommands());
+    updateLayerList();
+    updateBrushPresetUI();
+    statusBar()->showMessage("画布同步完成");
 }
 
 // ========== 快捷键设置相关函数 ==========
@@ -666,4 +949,65 @@ void MainWindow::saveShortcuts()
 
     settings.endGroup();
     settings.sync();
+}
+
+// ========== 上传画布到服务器 ==========
+void MainWindow::on_actionUploadCanvas_triggered()
+{
+    if (!m_network || !m_network->isConnected()) {
+        QMessageBox::warning(this, "未连接", "请先连接到服务器");
+        return;
+    }
+
+    // 弹出保存文件对话框，选择服务器上要保存的文件名
+    QString fileName = QFileDialog::getSaveFileName(this, "上传画布到服务器", "",
+                                                    "画布文件 (*.canvas)");
+    if (fileName.isEmpty()) return;
+
+    // 只保留文件名，不含路径（可根据需求调整）
+    QString baseName = QFileInfo(fileName).fileName();
+
+    // 构造上传命令
+    QJsonObject upload;
+    upload["type"] = "uploadCanvas";
+    upload["fileName"] = baseName;  // 服务器将文件保存在其工作目录下
+    upload["data"] = m_model->getFullState();
+
+    m_network->sendCommand(upload);
+    statusBar()->showMessage("正在上传画布到服务器...");
+}
+
+// ========== 从服务器下载画布 ==========
+void MainWindow::on_actionDownloadCanvas_triggered()
+{
+    if (!m_network || !m_network->isConnected()) {
+        QMessageBox::warning(this, "未连接", "请先连接到服务器");
+        return;
+    }
+
+    // 请求服务器发送画布文件列表
+    QJsonObject request;
+    request["type"] = "listCanvasFiles";
+    m_network->sendCommand(request);
+    statusBar()->showMessage("正在获取服务器画布文件列表...");
+}
+
+bool MainWindow::eventFilter(QObject *obj, QEvent *event) {
+    if (obj == ui->titleBar && event->type() == QEvent::MouseButtonPress) {
+        QMouseEvent *me = static_cast<QMouseEvent*>(event);
+        if (me->button() == Qt::LeftButton) {
+            m_dragPosition = me->globalPos() - frameGeometry().topLeft();
+            me->accept();
+            return true;
+        }
+    }
+    else if (obj == ui->titleBar && event->type() == QEvent::MouseMove) {
+        QMouseEvent *me = static_cast<QMouseEvent*>(event);
+        if (me->buttons() & Qt::LeftButton) {
+            move(me->globalPos() - m_dragPosition);
+            me->accept();
+            return true;
+        }
+    }
+    return QMainWindow::eventFilter(obj, event);
 }
